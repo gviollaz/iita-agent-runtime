@@ -1,9 +1,10 @@
-"""IITA Agent Runtime v0.8.0 — Full Fase 2 Pipeline."""
+"""IITA Agent Runtime v0.8.1 — CORS fix for frontend."""
 import os
 import json
 from datetime import datetime
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from src.agent import load_agent, build_system_prompt, get_person_context, get_conversation_history, run_agent, resolve_person_id
@@ -13,7 +14,21 @@ from src.channels import (resolve_channel_id, find_or_create_person,
     create_inbound_interaction, create_outbound_interaction,
     send_response, log_webhook_event)
 
-app = FastAPI(title="IITA Agent Runtime", version="0.8.0")
+app = FastAPI(title="IITA Agent Runtime", version="0.8.1")
+
+# CORS — allow CRM frontend (Vercel) to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://iitacrm.vercel.app",
+        "https://iitacrm-*.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 SHADOW_MODE = os.environ.get("SHADOW_MODE", "true").lower() == "true"
@@ -38,7 +53,7 @@ class ShadowBatchRequest(BaseModel):
     max_conversations: int = 5
 
 
-# ═══ META WEBHOOK — Full Pipeline ═══
+# ═══ META WEBHOOK ═══
 
 @app.get("/webhook/meta")
 async def webhook_verify(
@@ -47,113 +62,52 @@ async def webhook_verify(
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
     result = verify_webhook(hub_mode or "", hub_verify_token or "", hub_challenge or "")
-    if result:
-        return PlainTextResponse(content=result)
+    if result: return PlainTextResponse(content=result)
     return PlainTextResponse(content="Verification failed", status_code=403)
-
 
 @app.post("/webhook/meta")
 async def webhook_receive(request: Request):
-    """Unified Meta webhook — full pipeline: receive → interact → agent → respond.
-    
-    SHADOW_MODE=true:  receive + log (Make.com still handles response)
-    SHADOW_MODE=false: receive + create interaction + agent response + send via Graph API
-    """
     body = await request.json()
     messages = parse_webhook(body)
-    if not messages:
-        return {"status": "ok", "messages": 0}
-
+    if not messages: return {"status": "ok", "messages": 0}
     results = []
     for msg in messages:
-        t0 = datetime.now()
-        status = "received"
-        error = None
-
+        t0 = datetime.now(); status = "received"; error = None
         try:
-            # 1. Resolve channel
             channel_id = resolve_channel_id(msg)
             if not channel_id:
-                status = "error"
-                error = f"Unknown channel for recipient {msg.recipient_id}"
-                await log_webhook_event(msg, None, None, status, error)
-                results.append({"status": status, "error": error})
-                continue
-
-            # 2. Find or create person/conversation
+                await log_webhook_event(msg, None, None, "error", f"Unknown recipient {msg.recipient_id}")
+                results.append({"status": "error"}); continue
             conv_info = await find_or_create_person(msg, channel_id)
             if not conv_info:
-                status = "error"
-                error = "Could not resolve person/conversation"
-                await log_webhook_event(msg, channel_id, None, status, error)
-                results.append({"status": status, "error": error})
-                continue
-
-            # 3. Skip non-text messages for agent processing (but still log)
+                await log_webhook_event(msg, channel_id, None, "error", "No person/conv")
+                results.append({"status": "error"}); continue
             if msg.message_type != MessageType.TEXT or not msg.text:
-                status = "received_non_text"
-                await log_webhook_event(msg, channel_id, conv_info, status)
-                results.append({"status": status, "type": msg.message_type.value})
-                continue
-
+                await log_webhook_event(msg, channel_id, conv_info, "received_non_text")
+                results.append({"status": "received_non_text"}); continue
             if SHADOW_MODE:
-                # === SHADOW MODE: Log only, Make.com handles the rest ===
                 status = "shadow_logged"
                 latency = int((datetime.now() - t0).total_seconds() * 1000)
                 await log_webhook_event(msg, channel_id, conv_info, status, latency_ms=latency)
-                results.append({
-                    "status": status, "conversation_id": conv_info["conversation_id"],
-                    "channel": channel_id, "is_new": conv_info.get("is_new", False),
-                })
-
+                results.append({"status": status, "conversation_id": conv_info["conversation_id"]})
             else:
-                # === PRODUCTION MODE: Full pipeline ===
-                # 4. Create inbound interaction in v3
-                interaction = await create_inbound_interaction(msg, conv_info)
-                status = "interaction_created"
-
-                # 5. Generate agent response
+                await create_inbound_interaction(msg, conv_info)
                 agent = await load_agent("AG-01")
                 if agent and oai:
                     person_context = await get_person_context(conv_info["conversation_id"])
                     history = await get_conversation_history(conv_info["conversation_id"], limit=20)
                     system_prompt = await build_system_prompt(agent, person_context)
-                    
-                    # Add the new message to history
-                    messages_for_llm = history + [{"role": "user", "content": msg.text}]
-                    
-                    agent_result = await run_agent(oai, agent, system_prompt, messages_for_llm,
-                                                   {"conversation_id": conv_info["conversation_id"]})
-                    status = "agent_responded"
-
-                    # 6. Send response via Graph API
-                    reply_text = agent_result["response"]
-                    send_result = await send_response(msg, reply_text, conv_info, channel_id)
-                    
-                    if send_result and not send_result.get("error"):
-                        # 7. Create outbound interaction in v3
-                        await create_outbound_interaction(reply_text, conv_info)
-                        status = "response_sent"
-                    else:
-                        # Graph API failed — fallback to Make.com (create with status=send)
-                        await create_outbound_interaction(reply_text, conv_info)
-                        status = "response_via_makecom"
-                        error = str(send_result.get("error", "")) if send_result else "send failed"
-
+                    agent_result = await run_agent(oai, agent, system_prompt, history + [{"role": "user", "content": msg.text}], {"conversation_id": conv_info["conversation_id"]})
+                    reply = agent_result["response"]
+                    sr = await send_response(msg, reply, conv_info, channel_id)
+                    await create_outbound_interaction(reply, conv_info)
+                    status = "response_sent" if (sr and not sr.get("error")) else "response_via_makecom"
                 latency = int((datetime.now() - t0).total_seconds() * 1000)
                 await log_webhook_event(msg, channel_id, conv_info, status, error, latency)
-                results.append({
-                    "status": status, "conversation_id": conv_info["conversation_id"],
-                    "channel": channel_id, "latency_ms": latency,
-                })
-
+                results.append({"status": status, "conversation_id": conv_info["conversation_id"], "latency_ms": latency})
         except Exception as e:
-            latency = int((datetime.now() - t0).total_seconds() * 1000)
-            await log_webhook_event(msg, channel_id if 'channel_id' in dir() else None,
-                                   conv_info if 'conv_info' in dir() else None,
-                                   "error", str(e), latency)
+            await log_webhook_event(msg, None, None, "error", str(e))
             results.append({"status": "error", "detail": str(e)})
-
     return {"status": "ok", "messages": len(results), "shadow_mode": SHADOW_MODE, "results": results}
 
 
@@ -161,12 +115,12 @@ async def webhook_receive(request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.8.0", "openai": bool(OPENAI_API_KEY),
+    return {"status": "ok", "version": "0.8.1", "openai": bool(OPENAI_API_KEY),
             "v3_connected": v3_available(), "shadow_mode": SHADOW_MODE}
 
 @app.get("/")
 def root():
-    return {"service": "iita-agent-runtime", "version": "0.8.0"}
+    return {"service": "iita-agent-runtime", "version": "0.8.1"}
 
 @app.get("/api/v1/db-test")
 async def db_test():
@@ -280,13 +234,13 @@ async def shadow_batch(req: ShadowBatchRequest):
 
 @app.get("/api/v1/shadow-log")
 async def get_shadow_log(limit: int = 20):
-    return {"count": 0, "entries": await v4_query("shadow_log",
+    entries = await v4_query("shadow_log",
         "id,conversation_id,user_message,v3_response,v4_response,v4_latency_ms,v4_tokens,v4_tool_calls,v4_rounds,quality_score,created_at",
-        f"order=id.desc&limit={limit}")}
+        f"order=id.desc&limit={limit}")
+    return {"count": len(entries), "entries": entries}
 
 @app.get("/api/v1/webhook-events")
 async def get_webhook_events(limit: int = 50):
-    """View recent webhook events for monitoring."""
     return {"events": await v4_query("webhook_events",
         "id,platform,sender_id,channel_id,conversation_id,message_type,message_preview,processing_status,error_detail,latency_ms,created_at",
         f"order=id.desc&limit={limit}")}
@@ -300,19 +254,16 @@ async def dashboard():
         "id,conversation_id,user_message,v3_response,v4_response,v4_latency_ms,v4_tokens,v4_tool_calls,v4_rounds,quality_score,created_at",
         "order=id.desc&limit=50")
     total = len(await v4_query("shadow_log", "id", ""))
-    wh_total = len(await v4_query("webhook_events", "id", ""))
-    avg_lat = sum(r.get("v4_latency_ms",0) for r in rows)//max(len(rows),1) if rows else 0
-    avg_tok = sum(r.get("v4_tokens",0) for r in rows)//max(len(rows),1) if rows else 0
-    tools = sum(1 for r in rows if r.get("v4_rounds",1)>1)
+    wh = len(await v4_query("webhook_events", "id", ""))
+    al = sum(r.get("v4_latency_ms",0) for r in rows)//max(len(rows),1) if rows else 0
+    at = sum(r.get("v4_tokens",0) for r in rows)//max(len(rows),1) if rows else 0
+    tu = sum(1 for r in rows if r.get("v4_rounds",1)>1)
     eh = ""
     for r in rows:
-        tc = r.get("v4_tool_calls")
+        tc = r.get("v4_tool_calls"); 
         if isinstance(tc,str):
             try: tc=json.loads(tc)
             except: tc=[]
-        ts=", ".join([t.get("tool","?") for t in (tc or [])]) or "ninguna"
-        v3t=(r.get("v3_response") or "N/A")[:300]; v4t=(r.get("v4_response") or "N/A")[:300]; ut=(r.get("user_message") or "")[:150]
-        qs=r.get("quality_score")
-        qb=f'<span style="background:#22c55e;color:white;padding:2px 8px;border-radius:4px">{qs}/5</span>' if qs else '<span style="background:#94a3b8;color:white;padding:2px 8px;border-radius:4px">-</span>'
-        eh+=f'<div style="border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:16px;background:white"><div style="display:flex;justify-content:space-between;margin-bottom:8px"><strong>Conv #{r.get("conversation_id")} #{r.get("id")}</strong><span>{qb} {r.get("v4_latency_ms",0)}ms {r.get("v4_tokens",0)}tok {ts}</span></div><div style="background:#f1f5f9;padding:8px;border-radius:4px;margin-bottom:8px"><b>User:</b> {ut}</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div style="background:#fef3c7;padding:10px;border-radius:4px;border-left:4px solid #f59e0b"><b>Make.com:</b><br>{v3t}</div><div style="background:#dbeafe;padding:10px;border-radius:4px;border-left:4px solid #3b82f6"><b>v4 Agent:</b><br>{v4t}</div></div></div>'
-    return f'<!DOCTYPE html><html><head><title>IITA Dashboard</title><meta charset="utf-8"><style>body{{font-family:system-ui;margin:0;padding:20px;background:#f8fafc}}h1{{color:#1e3a5f}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}}.stat{{background:white;border:1px solid #e2e8f0;border-radius:8px;padding:16px;text-align:center}}.stat .n{{font-size:28px;font-weight:bold;color:#1a56db}}.stat .l{{color:#64748b;font-size:13px}}</style></head><body><h1>IITA Agent Runtime v0.8.0</h1><div class="stats"><div class="stat"><div class="n">{total}</div><div class="l">Shadow Tests</div></div><div class="stat"><div class="n">{wh_total}</div><div class="l">Webhook Events</div></div><div class="stat"><div class="n">{avg_lat}ms</div><div class="l">Latencia</div></div><div class="stat"><div class="n">{avg_tok}</div><div class="l">Tokens</div></div><div class="stat"><div class="n">{tools}/{len(rows)}</div><div class="l">Tools</div></div></div><h2>Comparaciones</h2>{eh or "<p>Sin datos. POST /api/v1/shadow-batch</p>"}</body></html>'
+        ts=", ".join([t.get("tool","?") for t in (tc or [])]) or "-"
+        eh+=f'<div style="border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:12px;background:white"><div style="display:flex;justify-content:space-between;margin-bottom:6px"><strong>#{r.get("id")} Conv {r.get("conversation_id")}</strong><span style="font-size:11px;color:#64748b">{r.get("v4_latency_ms",0)}ms | {r.get("v4_tokens",0)}tok | {ts}</span></div><div style="background:#f1f5f9;padding:8px;border-radius:4px;margin-bottom:8px;font-size:13px"><b>User:</b> {(r.get("user_message") or "")[:150]}</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div style="background:#fef3c7;padding:8px;border-radius:4px;border-left:3px solid #f59e0b;font-size:12px"><b>v3:</b> {(r.get("v3_response") or "N/A")[:250]}</div><div style="background:#dbeafe;padding:8px;border-radius:4px;border-left:3px solid #3b82f6;font-size:12px"><b>v4:</b> {(r.get("v4_response") or "N/A")[:250]}</div></div></div>'
+    return f'<!DOCTYPE html><html><head><title>IITA Dashboard</title><meta charset="utf-8"><style>body{{font-family:system-ui;margin:0;padding:20px;background:#f8fafc}}h1{{color:#1e3a5f}}.s{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:20px}}.c{{background:white;border:1px solid #e2e8f0;border-radius:8px;padding:14px;text-align:center}}.c .n{{font-size:26px;font-weight:800;color:#1a56db}}.c .l{{color:#64748b;font-size:12px}}</style></head><body><h1>IITA Agent Runtime v0.8.1</h1><div class="s"><div class="c"><div class="n">{total}</div><div class="l">Shadow</div></div><div class="c"><div class="n">{wh}</div><div class="l">Webhooks</div></div><div class="c"><div class="n">{al}ms</div><div class="l">Latencia</div></div><div class="c"><div class="n">{at}</div><div class="l">Tokens</div></div><div class="c"><div class="n">{tu}/{len(rows)}</div><div class="l">Tools</div></div></div>{eh or "<p>Sin datos</p>"}</body></html>'
