@@ -7,7 +7,6 @@ from src.tools import TOOL_DEFINITIONS, execute_tool
 
 
 async def load_agent(agent_code: str = "AG-01") -> dict:
-    """Load agent identity from v4 DB."""
     agents = await v4_query("agent_identities",
         "agent_code,name,role,personality,model,temperature,max_tokens,available_tools",
         f"agent_code=eq.{agent_code}")
@@ -15,7 +14,6 @@ async def load_agent(agent_code: str = "AG-01") -> dict:
 
 
 async def build_system_prompt(agent: dict, person_context: str = "") -> str:
-    """Build system prompt from agent identity + DB fragments + context."""
     personality = agent.get("personality", {})
     if isinstance(personality, str):
         personality = json.loads(personality)
@@ -62,7 +60,6 @@ REGLAS:
 
 
 async def resolve_person_id(conversation_id: int) -> int:
-    """Resolve person_id from conversation_id via v3 person_conversation table."""
     if not v3_available():
         return 0
     pc = await v3_query("person_conversation", "id_person", f"id_conversation=eq.{conversation_id}&limit=1")
@@ -70,10 +67,8 @@ async def resolve_person_id(conversation_id: int) -> int:
 
 
 async def get_person_context(conversation_id: int) -> str:
-    """Get person context from v3 CRM."""
     if not v3_available():
         return ""
-    # First resolve person_id from conversation
     person_id = await resolve_person_id(conversation_id)
     if not person_id:
         return ""
@@ -87,7 +82,11 @@ async def get_person_context(conversation_id: int) -> str:
 
 
 async def get_conversation_history(conversation_id: int, limit: int = 20) -> list:
-    """Read last N messages from a v3 CRM conversation."""
+    """Read last N messages from a v3 CRM conversation.
+    
+    V3 schema: interactions has 'text' (not 'content'), 'time_stamp' (not 'timestamp').
+    Direction is inferred: id_person_conversation = inbound, id_system_conversation = outbound.
+    """
     if not v3_available():
         return []
     pc = await v3_query("person_conversation", "id", f"id_conversation=eq.{conversation_id}")
@@ -98,21 +97,35 @@ async def get_conversation_history(conversation_id: int, limit: int = 20) -> lis
     pc_id = pc[0]["id"] if pc else -1
     sc_id = sc[0]["id"] if sc else -1
     
-    interactions = await v3_query(
+    # Query inbound (person → system) messages
+    inbound = await v3_query(
         "interactions",
-        "id,content,direction,timestamp,message_type",
-        f"or=(id_person_conversation.eq.{pc_id},id_system_conversation.eq.{sc_id})"
-        f"&content_type=eq.text"
-        f"&order=timestamp.desc&limit={limit}"
-    )
+        "id,text,time_stamp,id_person_conversation",
+        f"id_person_conversation=eq.{pc_id}&text=not.is.null&order=time_stamp.desc&limit={limit}"
+    ) if pc_id > 0 else []
     
-    messages = []
-    for ix in reversed(interactions):
-        if not ix.get("content"):
-            continue
-        role = "user" if ix["direction"] == "inbound" else "assistant"
-        messages.append({"role": role, "content": ix["content"]})
-    return messages
+    # Query outbound (system → person) messages
+    outbound = await v3_query(
+        "interactions",
+        "id,text,time_stamp,id_system_conversation",
+        f"id_system_conversation=eq.{sc_id}&text=not.is.null&order=time_stamp.desc&limit={limit}"
+    ) if sc_id > 0 else []
+    
+    # Merge, tag direction, sort by timestamp
+    all_msgs = []
+    for ix in inbound:
+        if ix.get("text"):
+            all_msgs.append({"role": "user", "content": ix["text"], "ts": ix["time_stamp"]})
+    for ix in outbound:
+        if ix.get("text"):
+            all_msgs.append({"role": "assistant", "content": ix["text"], "ts": ix["time_stamp"]})
+    
+    # Sort chronologically and take last N
+    all_msgs.sort(key=lambda x: x["ts"])
+    all_msgs = all_msgs[-limit:]
+    
+    # Remove ts before returning
+    return [{"role": m["role"], "content": m["content"]} for m in all_msgs]
 
 
 async def run_agent(
@@ -123,10 +136,6 @@ async def run_agent(
     context: dict = None,
     max_tool_rounds: int = 3,
 ) -> dict:
-    """Run the agent with tool-calling loop.
-    
-    Returns dict with: response, usage, latency_ms, tool_calls
-    """
     context = context or {}
     model = agent.get("model", "gpt-4o")
     temperature = float(agent.get("temperature", 0.7))
