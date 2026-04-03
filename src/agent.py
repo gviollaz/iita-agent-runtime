@@ -25,7 +25,6 @@ async def build_system_prompt(agent: dict, person_context: str = "") -> str:
     origin = personality.get("origin", "Salta")
     age = personality.get("age", 24)
 
-    # Load fragments, patterns, settings in parallel
     patterns = await v4_query("response_evaluation_patterns",
         "pattern_text,description", "pattern_type=eq.forbidden_phrase&is_active=eq.true")
     fragments = await v4_query("prompt_fragments",
@@ -62,12 +61,24 @@ REGLAS:
     return prompt
 
 
+async def resolve_person_id(conversation_id: int) -> int:
+    """Resolve person_id from conversation_id via v3 person_conversation table."""
+    if not v3_available():
+        return 0
+    pc = await v3_query("person_conversation", "id_person", f"id_conversation=eq.{conversation_id}&limit=1")
+    return pc[0]["id_person"] if pc else 0
+
+
 async def get_person_context(conversation_id: int) -> str:
     """Get person context from v3 CRM."""
     if not v3_available():
         return ""
+    # First resolve person_id from conversation
+    person_id = await resolve_person_id(conversation_id)
+    if not person_id:
+        return ""
     result = await v3_rpc("get_person_context_for_ai", {
-        "p_person_id": 0,
+        "p_person_id": person_id,
         "p_conversation_id": conversation_id,
     })
     if result and isinstance(result, str):
@@ -79,7 +90,6 @@ async def get_conversation_history(conversation_id: int, limit: int = 20) -> lis
     """Read last N messages from a v3 CRM conversation."""
     if not v3_available():
         return []
-    # Get person_conversation and system_conversation for this conversation
     pc = await v3_query("person_conversation", "id", f"id_conversation=eq.{conversation_id}")
     sc = await v3_query("system_conversation", "id", f"id_conversation=eq.{conversation_id}")
     if not pc and not sc:
@@ -88,7 +98,6 @@ async def get_conversation_history(conversation_id: int, limit: int = 20) -> lis
     pc_id = pc[0]["id"] if pc else -1
     sc_id = sc[0]["id"] if sc else -1
     
-    # Query interactions for both person and system conversations
     interactions = await v3_query(
         "interactions",
         "id,content,direction,timestamp,message_type",
@@ -97,7 +106,6 @@ async def get_conversation_history(conversation_id: int, limit: int = 20) -> lis
         f"&order=timestamp.desc&limit={limit}"
     )
     
-    # Convert to OpenAI message format, reversed (oldest first)
     messages = []
     for ix in reversed(interactions):
         if not ix.get("content"):
@@ -140,7 +148,6 @@ async def run_agent(
         total_tokens += response.usage.total_tokens
         choice = response.choices[0]
 
-        # If no tool calls, we have the final response
         if choice.finish_reason != "tool_calls" or not choice.message.tool_calls:
             latency_ms = int((datetime.now() - t0).total_seconds() * 1000)
             return {
@@ -155,13 +162,11 @@ async def run_agent(
                 "rounds": round_num + 1,
             }
 
-        # Process tool calls
         all_messages.append(choice.message)
         for tc in choice.message.tool_calls:
             fn_name = tc.function.name
             fn_args = json.loads(tc.function.arguments)
             
-            # Execute the tool
             result = await execute_tool(fn_name, fn_args, context)
             tool_calls_log.append({
                 "tool": fn_name,
@@ -169,17 +174,15 @@ async def run_agent(
                 "result_length": len(result),
             })
             
-            # Feed result back to LLM
             all_messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": result,
             })
 
-    # Should not reach here, but just in case
     latency_ms = int((datetime.now() - t0).total_seconds() * 1000)
     return {
-        "response": "Lo siento, tuve un problema procesando tu consulta. Voy a revisar y te respondo.",
+        "response": "Lo siento, tuve un problema procesando tu consulta.",
         "usage": {"total_tokens": total_tokens},
         "latency_ms": latency_ms,
         "tool_calls": tool_calls_log,
