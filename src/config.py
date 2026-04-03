@@ -1,32 +1,11 @@
-"""Application settings from environment variables."""
-from pydantic_settings import BaseSettings
+"""Configuration — loaded from environment."""
+import os
 
-
-class Settings(BaseSettings):
-    VERSION: str = "0.1.0"
-    ENVIRONMENT: str = "development"
-    LOG_LEVEL: str = "INFO"
-    SHADOW_MODE: bool = True
-
-    SUPABASE_URL: str = ""
-    SUPABASE_ANON_KEY: str = ""
-    SUPABASE_SERVICE_KEY: str = ""
-    DATABASE_URL: str = ""
-
-    OPENAI_API_KEY: str = ""
-    ANTHROPIC_API_KEY: str = ""
-
-    LANGCHAIN_TRACING_V2: bool = True
-    LANGCHAIN_API_KEY: str = ""
-    LANGCHAIN_PROJECT: str = "iita-agent-runtime"
-
-    META_GRAPH_TOKEN: str = ""
-    META_GRAPH_TOKEN_COEX: str = ""
-    MERCADOPAGO_ACCESS_TOKEN: str = ""
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
+class Settings:
+    VERSION = "0.4.0"
+    ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+    SHADOW_MODE = os.environ.get("SHADOW_MODE", "true").lower() == "true"
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 settings = Settings()

@@ -1,51 +1,46 @@
-"""Database connection pool (asyncpg) for Supabase v4."""
-import asyncpg
-from src.config import settings
+"""Database helpers — Supabase v4 (config) + v3 (CRM data)."""
+import os
+import httpx
 
-_pool: asyncpg.Pool | None = None
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_V3_URL = os.environ.get("SUPABASE_V3_URL", "")
+SUPABASE_V3_KEY = os.environ.get("SUPABASE_V3_SERVICE_KEY", "")
 
+def _v4h():
+    return {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
 
-async def get_pool() -> asyncpg.Pool:
-    """Get or create the asyncpg connection pool."""
-    global _pool
-    if _pool is None:
-        if not settings.DATABASE_URL:
-            raise RuntimeError("DATABASE_URL not configured")
-        _pool = await asyncpg.create_pool(
-            settings.DATABASE_URL,
-            min_size=2,
-            max_size=10,
-            command_timeout=30,
-            server_settings={"application_name": "iita-agent-runtime"},
-        )
-    return _pool
+def _v3h():
+    return {"apikey": SUPABASE_V3_KEY, "Authorization": f"Bearer {SUPABASE_V3_KEY}", "Content-Type": "application/json"}
 
+async def v4_query(table: str, select: str, filters: str = "") -> list:
+    """Query v4 Supabase via REST."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}?select={select}"
+    if filters:
+        url += f"&{filters}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=_v4h(), timeout=10)
+        return r.json() if r.status_code == 200 else []
 
-async def fetch_one(query: str, *args) -> dict | None:
-    """Execute query and return one row as dict."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(query, *args)
-        return dict(row) if row else None
+async def v3_rpc(fn: str, params: dict, timeout: int = 15):
+    """Call v3 CRM RPC function."""
+    if not SUPABASE_V3_URL or not SUPABASE_V3_KEY:
+        return None
+    url = f"{SUPABASE_V3_URL}/rest/v1/rpc/{fn}"
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=_v3h(), json=params, timeout=timeout)
+        return r.json() if r.status_code == 200 else None
 
+async def v3_query(table: str, select: str, filters: str = "") -> list:
+    """Query v3 CRM table via REST."""
+    if not SUPABASE_V3_URL or not SUPABASE_V3_KEY:
+        return []
+    url = f"{SUPABASE_V3_URL}/rest/v1/{table}?select={select}"
+    if filters:
+        url += f"&{filters}"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, headers=_v3h(), timeout=10)
+        return r.json() if r.status_code == 200 else []
 
-async def fetch_all(query: str, *args) -> list[dict]:
-    """Execute query and return all rows as list of dicts."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *args)
-        return [dict(r) for r in rows]
-
-
-async def execute(query: str, *args) -> str:
-    """Execute a command (INSERT, UPDATE, DELETE)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.execute(query, *args)
-
-
-async def fetch_val(query: str, *args):
-    """Execute query and return a single value."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchval(query, *args)
+def v3_available() -> bool:
+    return bool(SUPABASE_V3_URL and SUPABASE_V3_KEY)
